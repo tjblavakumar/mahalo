@@ -1,0 +1,56 @@
+# ============================================================
+# MAHALO Environment Configuration Template
+# ============================================================
+# Copy the relevant lines to your .env file
+# ============================================================
+
+# ============================================================
+# Proxy Configuration (IMPORTANT for Corporate Environments)
+# ============================================================
+# If you're behind a corporate proxy, add these to your .env file.
+# CRITICAL: Include localhost,127.0.0.1 in NO_PROXY to ensure
+# local services bypass the proxy!
+
+# For Federal Reserve Bank users:
+HTTP_PROXY=http://p1proxy.frb.org:8080
+HTTPS_PROXY=http://p1proxy.frb.org:8080
+NO_PROXY=localhost,127.0.0.1,.frgb.gov,.frb.org,.frb.pvt,.base.awscfs.frb.pvt,.frb.gov,.frbres.org
+
+# For other corporate environments:
+# HTTP_PROXY=http://your-proxy:port
+# HTTPS_PROXY=http://your-proxy:port
+# NO_PROXY=localhost,127.0.0.1,your-internal-domains
+
+# ============================================================
+# Application Ports
+# ============================================================
+MAIN_API_PORT=8000
+JIRA_API_PORT=5001
+SERVICENOW_API_PORT=5002
+SPLUNK_API_PORT=5003
+JIRA_MCP_PORT=6001
+SERVICENOW_MCP_PORT=6002
+SPLUNK_MCP_PORT=6003
+FRONTEND_PORT=3000
+
+# ============================================================
+# Database Configuration
+# ============================================================
+DATABASE_URL=sqlite:///./mahalo.db
+
+# ============================================================
+# AI/LLM Configuration
+# ============================================================
+ONE_MIN_AI_API_KEY=your-api-key-here
+ONE_MIN_AI_BASE_URL=https://api.1min.ai/v1
+LITELLM_MODEL=gpt-4o-mini
+
+# ============================================================
+# Instructions
+# ============================================================
+# 1. Copy the proxy settings above to your .env file
+# 2. Make sure localhost,127.0.0.1 is at the start of NO_PROXY
+# 3. Restart all MAHALO services
+# 4. Run: python test_proxy_config.py to verify
+#
+# For more information, see PROXY_CONFIGURATION.md

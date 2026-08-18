@@ -11,7 +11,7 @@ class JiraAgent:
     async def retrieve_context(self, query: str) -> dict[str, Any]:
         query_lower = query.lower()
         story_match = re.search(r"\bstory[- ]?(\d+)\b", query_lower)
-        if story_match and any(term in query_lower for term in ("test", "qa", "acceptance", "validate")):
+        if story_match:
             story_key = f"STORY-{story_match.group(1)}"
             result = await self.tools.get_story_handler({"story_key": story_key})
             return {"source": "JIRA", "query": query, "story_key": story_key, "record_type": "story_detail", **result}

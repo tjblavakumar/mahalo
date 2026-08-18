@@ -22,6 +22,14 @@ def test_classifier_extracts_story_detail_and_write_confirmation():
     assert write["requires_confirmation"] is True
 
 
+def test_classifier_routes_plain_story_key_to_detail():
+    result = IntentClassifier().classify("What is STORY-101?")
+
+    assert result["intent"] == "story_detail"
+    assert result["agents"] == ["JIRA Agent"]
+    assert result["entities"]["story_key"] == "STORY-101"
+
+
 def test_classifier_routes_executive_update_to_all_tools():
     result = IntentClassifier().classify("Give me the executive update for MahaloPay")
 

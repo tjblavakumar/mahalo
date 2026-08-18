@@ -73,6 +73,8 @@ class IntentClassifier:
             return self._result("executive_overview", ["JIRA Agent", "ServiceNow Agent", "Splunk Agent"])
         if any(term in query for term in ("write a test", "test case", "qa test", "validate")):
             return self._result("write_test_case", ["JIRA Agent"], story_key=story_key)
+        if story_key:
+            return self._result("story_detail", ["JIRA Agent"], story_key=story_key)
         if any(term in query for term in ("create", "save", "write", "add")) and "story" in query:
             return self._result("create_story", ["JIRA Agent", "Splunk Agent"], requires_confirmation=True)
         if "deploy" in query or ("production" in query and "feature" in query):

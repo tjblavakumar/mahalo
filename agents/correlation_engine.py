@@ -151,28 +151,11 @@ class CorrelationEngine:
         stories = jira_data.get("stories", [])
         incidents = servicenow_data.get("incidents", [])
         
-        # Correlation 1: Errors without corresponding JIRA stories
-        for theme, theme_errors in error_themes.items():
-            if theme == "other":
-                continue
-            
-            # Check if there's a story covering this theme
-            has_story = any(
-                self._theme_matches_story(theme, story)
-                for story in stories
-            )
-            
-            if not has_story and len(theme_errors) > 0:
-                correlations.append({
-                    "type": "error_without_story",
-                    "theme": theme,
-                    "error_count": len(theme_errors),
-                    "sample_error": theme_errors[0].get("message", ""),
-                    "severity": "high" if len(theme_errors) >= 3 else "medium",
-                    "recommendation": f"Create JIRA story to address {theme.replace('_', ' ')} issues",
-                })
-        
-        # Correlation 2: Active incidents linked to production errors
+        # Uncovered error themes are reported as gaps below, so they should not
+        # also be emitted as correlations.
+
+        # Correlation 1: Active incidents linked to production errors
+        seen_incidents = set()
         for incident in incidents:
             if incident.get("status", "").lower() not in {"active", "new", "monitoring"}:
                 continue
@@ -183,7 +166,9 @@ class CorrelationEngine:
                 if self._error_relates_to_incident(error, incident)
             ]
             
-            if related_errors:
+            incident_key = incident.get("incident_id") or incident_title
+            if related_errors and incident_key not in seen_incidents:
+                seen_incidents.add(incident_key)
                 correlations.append({
                     "type": "incident_with_errors",
                     "incident_id": incident.get("incident_id"),
@@ -193,7 +178,7 @@ class CorrelationEngine:
                     "recommendation": "Investigate error logs for root cause",
                 })
         
-        # Correlation 3: Stories without test coverage for recurring errors
+        # Correlation 2: Stories without test coverage for recurring errors
         for story in stories:
             if story.get("status", "").lower() == "done":
                 story_theme = self._extract_theme_from_story(story)
@@ -484,7 +469,12 @@ class CorrelationEngine:
         if correlations:
             parts.append(f"CORRELATIONS ({len(correlations)} found):")
             for corr in correlations[:5]:
-                parts.append(f"- {corr.get('type')}: {corr.get('recommendation', '')}")
+                detail = corr.get("recommendation", "")
+                if corr.get("incident_id") or corr.get("incident_title"):
+                    incident = corr.get("incident_id") or "Incident"
+                    title = corr.get("incident_title")
+                    detail = f"{incident} ({title}) - {detail}" if title else f"{incident} - {detail}"
+                parts.append(f"- {corr.get('type')}: {detail}")
             parts.append("")
         
         # Gaps

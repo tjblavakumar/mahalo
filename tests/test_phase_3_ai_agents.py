@@ -375,6 +375,34 @@ def test_story_test_case_uses_requested_story_detail(monkeypatch):
     assert "JIRA found" not in response
 
 
+def test_plain_story_key_returns_jira_details(monkeypatch):
+    from backend.config import settings
+
+    class StoryTools:
+        async def get_story_handler(self, arguments):
+            return {
+                "success": True,
+                "data": {
+                    "story_key": arguments["story_key"],
+                    "title": "Protect payment capacity during traffic spikes",
+                    "status": "In Progress",
+                    "description": "Add connection-pool protection and retry backoff.",
+                    "assignee_username": "alex",
+                    "story_points": 5,
+                },
+            }
+
+    monkeypatch.setattr(settings, "ONE_MIN_AI_API_KEY", "")
+    agent = OrchestratorAgent(jira_agent=JiraAgent(tools=StoryTools()))
+    import asyncio
+
+    response = asyncio.run(agent.process_query("Executive", "what is STORY-101"))
+    assert "STORY-101" in response
+    assert "Protect payment capacity during traffic spikes" in response
+    assert "connection-pool protection" in response
+    assert "JIRA found 0 matching stories" not in response
+
+
 def test_missing_story_test_case_explains_how_to_recover(monkeypatch):
     from backend.config import settings
 
@@ -463,6 +491,39 @@ def test_executive_update_combines_all_tools(monkeypatch):
     assert "MahaloPay executive update" in response
     assert "deployed features" in response
     assert "error logs" in response
+
+
+def test_correlation_engine_deduplicates_redundant_insights():
+    from agents.correlation_engine import CorrelationEngine
+
+    engine = CorrelationEngine()
+    insights = engine.correlate_contexts([
+        {"source": "JIRA", "success": True, "data": {"items": []}},
+        {
+            "source": "ServiceNow",
+            "success": True,
+            "data": {
+                "incidents": [
+                    {"incident_id": "INC-1", "status": "Active", "title": "Connection database errors"},
+                    {"incident_id": "INC-1", "status": "Active", "title": "Connection database errors"},
+                ],
+                "deployments": [],
+            },
+        },
+        {
+            "source": "Splunk",
+            "success": True,
+            "data": {"items": [{"level": "ERROR", "message": "Connection database failure"}]},
+        },
+    ])
+
+    assert not any(correlation["type"] == "error_without_story" for correlation in insights["correlations"])
+    assert sum(
+        correlation["type"] == "incident_with_errors"
+        for correlation in insights["correlations"]
+    ) == 1
+    assert [gap["type"] for gap in insights["gaps"]].count("uncovered_errors") == 1
+    assert "INC-1 (Connection database errors)" in engine.format_insights_for_llm()
 
 
 def test_greeting_does_not_query_tools(monkeypatch):

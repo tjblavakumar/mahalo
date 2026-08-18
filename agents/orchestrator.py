@@ -974,6 +974,24 @@ class OrchestratorAgent:
                 f"- Reliability: {len(errors)} error logs out of {len(logs)} total logs.\n"
                 "Priority: review the recurring payment gateway, capacity, and reconciliation signals before expanding the roadmap."
             )
+
+        story_detail_context = next(
+            (item for item in successful if item.get("record_type") == "story_detail"),
+            None,
+        )
+        if story_detail_context:
+            story_key = story_detail_context.get("story_key", "the requested story")
+            story = story_detail_context.get("data", {})
+            if story:
+                return (
+                    f"{persona}, here are the details for {story.get('story_key', story_key)}:\n\n"
+                    f"Title: {story.get('title', 'Untitled story')}\n"
+                    f"Status: {story.get('status', 'Unknown')}\n"
+                    f"Description: {story.get('description', 'No description available.')}\n"
+                    f"Assignee: {story.get('assignee_username') or 'Unassigned'}\n"
+                    f"Story points: {story.get('story_points', 'Not estimated')}"
+                )
+            return f"{persona}, I could not find {story_key} in the current JIRA data."
         # Note: Deployment queries are now handled earlier in this function
         if any(term in query_lower for term in ("test case", "test cases", "qa test", "write a test")):
             context = next((item for item in successful if item.get("record_type") == "story_detail"), None)

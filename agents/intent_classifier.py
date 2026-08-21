@@ -120,16 +120,18 @@ class IntentClassifier:
                 content = content.split("```")[0].strip()
             parsed = json.loads(content)
             validated = self._validate(parsed, fallback)
-            # Use fallback if: (1) LLM confidence is very low, OR (2) fallback has much higher confidence
+            # If LLM confidence is very low, use fallback
             if validated["confidence"] < CONFIDENCE_THRESHOLD:
                 logger.info(
                     "Low-confidence LLM intent %r (%.2f) for query=%r; using fallback intent %r",
                     validated["intent"], validated["confidence"], query, fallback["intent"],
                 )
                 return fallback
-            if fallback["confidence"] - validated["confidence"] >= 0.3:
+            # If fallback has higher confidence than LLM, prefer fallback
+            # (keyword rules are precise; they should win over uncertain LLM)
+            if fallback["confidence"] > validated["confidence"]:
                 logger.info(
-                    "Fallback intent %r (%.2f) much stronger than LLM %r (%.2f) for query=%r",
+                    "Fallback intent %r (%.2f) stronger than LLM %r (%.2f) for query=%r",
                     fallback["intent"], fallback["confidence"], validated["intent"], validated["confidence"], query,
                 )
                 return fallback

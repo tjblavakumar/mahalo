@@ -90,7 +90,7 @@ async def one_min_ai_completion(
         },
     }
 
-    async with httpx.AsyncClient(timeout=30.0, trust_env=True) as client:
+    async with httpx.AsyncClient(timeout=90.0, trust_env=True) as client:
         response = await client.post(
             "https://api.1min.ai/api/chat-with-ai",
             headers={

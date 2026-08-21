@@ -251,6 +251,22 @@ class OrchestratorAgent:
         context_text = json.dumps(contexts, default=str)
         insights_text = self.correlation_engine.format_insights_for_llm()
 
+        # Detect if user is asking for code/implementation help
+        is_code_request = any(term in query.lower() for term in (
+            "code", "sample code", "implement", "fix code", "how to fix", "snippet",
+            "example code", "write code", "solution code", "patch",
+        ))
+        max_tokens = 1200 if is_code_request else 600
+
+        code_instruction = ""
+        if is_code_request:
+            code_instruction = (
+                "\n\nIMPORTANT: The user is explicitly asking for CODE. "
+                "After a brief 1-2 line diagnosis, provide working sample code that addresses the issue. "
+                "Use appropriate programming language (Python unless specified otherwise). "
+                "Include comments explaining the fix. Keep analysis minimal — focus on the code solution."
+            )
+
         if settings.ONE_MIN_AI_API_KEY:
             try:
                 response = await one_min_ai_completion(
@@ -265,7 +281,9 @@ class OrchestratorAgent:
                                 "and explain uncertainty when the evidence is insufficient.\n\n"
                                 f"{self._role_system_instructions(persona)}\n\n"
                                 f"Classified intent: {intent.get('intent')} (confidence: {intent.get('confidence', 0.5)})\n\n"
-                                "Be specific, be analytical, be helpful. Don't just list data - interpret it!"
+                                "Be specific, be analytical, be helpful. Don't just list data - interpret it!\n"
+                                "If the user asks for code, sample code, or implementation help, provide concrete "
+                                f"code examples based on the bug/story context. Use appropriate language and patterns.{code_instruction}"
                             )
                         },
                         {
@@ -278,10 +296,11 @@ class OrchestratorAgent:
                         },
                     ],
                     temperature=0.4,
-                    max_tokens=600,
+                    max_tokens=max_tokens,
                 )
                 llm_text = response.choices[0].message.content
-                if self._llm_response_is_grounded(query, llm_text, contexts):
+                # Skip grounding check for code requests — code can't be "grounded" in JIRA data
+                if is_code_request or self._llm_response_is_grounded(query, llm_text, contexts):
                     return llm_text
             except Exception:
                 pass
@@ -1948,10 +1967,11 @@ class OrchestratorAgent:
                         },
                     ],
                     temperature=0.4,  # Slightly higher for more creative analysis
-                    max_tokens=600,  # More tokens for detailed analysis
+                    max_tokens=1200 if any(t in user_query.lower() for t in ("code", "sample code", "implement", "fix code", "how to fix", "snippet", "example code", "write code", "solution code", "patch")) else 600,
                 )
                 llm_text = response.choices[0].message.content
-                if self._llm_response_is_grounded(user_query, llm_text, contexts):
+                is_code_req = any(t in user_query.lower() for t in ("code", "sample code", "implement", "fix code", "how to fix", "snippet", "example code", "write code", "solution code", "patch"))
+                if is_code_req or self._llm_response_is_grounded(user_query, llm_text, contexts):
                     return llm_text
             except Exception:
                 pass

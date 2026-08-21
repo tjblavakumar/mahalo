@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-set -e
+# Start all MAHALO services in background
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 mkdir -p "$ROOT_DIR/logs"
 
 echo "============================================================"
-echo " MAHALO - Starting All Services (Linux)"
+echo " MAHALO - Starting All Services"
 echo "============================================================"
 
 if [ ! -f "$ROOT_DIR/venv/bin/activate" ]; then
@@ -16,11 +16,9 @@ if [ ! -f "$ROOT_DIR/venv/bin/activate" ]; then
   exit 1
 fi
 
-source "$ROOT_DIR/venv/bin/activate"
-python --version
-
+source "$ROOT_DIR/venv/bin/activate" || true
+echo "Python: $(python --version 2>&1)"
 echo ""
-read -rp $'Ready to start services. Press Enter to continue...\n' _
 
 ECHO_PREFIX="[INFO]"
 
@@ -46,8 +44,8 @@ nohup python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 > "$ROOT_DIR/log
 echo "$ECHO_PREFIX Started Main API Gateway on port 8000"
 
 if [ -d "$ROOT_DIR/frontend" ]; then
-  (cd "$ROOT_DIR/frontend" && nohup npm start > "$ROOT_DIR/logs/frontend.log" 2>&1 &) 
-  echo "$ECHO_PREFIX Started React Frontend on port 3000"
+  (cd "$ROOT_DIR/frontend" && nohup npm start > "$ROOT_DIR/logs/frontend.log" 2>&1 &)
+  echo "$ECHO_PREFIX Started Frontend on port 3000"
 fi
 
 echo ""
@@ -56,10 +54,10 @@ echo " All services started in background!"
 echo "============================================================"
 echo ""
 echo "Services:"
-echo "  - JIRA API: http://localhost:5001/docs"
+echo "  - JIRA API:       http://localhost:5001/docs"
 echo "  - ServiceNow API: http://localhost:5002/docs"
-echo "  - Splunk API: http://localhost:5003/docs"
-echo "  - Main API: http://localhost:8000/docs"
-echo "  - Frontend: http://localhost:3000"
+echo "  - Splunk API:     http://localhost:5003/docs"
+echo "  - Main API:       http://localhost:8000/docs"
+echo "  - Frontend:       http://localhost:3000"
 echo ""
-echo "Logs are stored in: $ROOT_DIR/logs"
+echo "Logs: $ROOT_DIR/logs/"

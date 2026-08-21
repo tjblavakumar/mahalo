@@ -414,8 +414,8 @@ async def generate_enhanced_test_data(
                     batch_data = await generator.generate_servicenow_incidents(batch, existing_incident_keys)
                 except (httpx.ReadTimeout, httpx.ConnectTimeout):
                         print(f"    Timeout, skipping batch.")
-                    remaining -= batch
-                    continue
+                        remaining -= batch
+                        continue
 
                 for incident_info in batch_data:
                     incident = ServiceNowIncident(

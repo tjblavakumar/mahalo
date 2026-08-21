@@ -77,6 +77,7 @@ class OrchestratorAgent:
             "executive_overview": "get a high-level executive overview of the project",
             "analyze_errors": "analyze production errors and failure patterns",
             "suggest_features": "suggest features or stories based on production signals",
+            "suggest_work_item": "find an easy or low-effort item for you to pick up next",
             "count_deployments": "check what has been deployed to production",
             "check_velocity": "review team velocity and sprint progress",
             "story_detail": "look up details for a specific JIRA story",

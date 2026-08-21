@@ -20,9 +20,8 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 import httpx
-from openai import AsyncOpenAI
 
-from backend.config import get_llm_config, settings
+from backend.config import settings
 from backend.database import SessionLocal, init_db
 from backend.models.jira_models import JiraBug, JiraSprint, JiraStory, JiraUser
 from backend.models.servicenow_models import ServiceNowDeployment, ServiceNowIncident
@@ -36,13 +35,45 @@ class LLMTestDataGenerator:
     def __init__(self, seed: int = 42):
         self.seed = seed
         random.seed(seed)
-        llm_config = get_llm_config()
-        self.client = AsyncOpenAI(
-            api_key=llm_config["api_key"],
-            base_url=llm_config["base_url"],
-        )
-        self.model = llm_config["model"]
+        self.api_key = settings.ONE_MIN_AI_API_KEY
+        self.model = settings.LITELLM_MODEL
         self.generated_keys = set()
+
+    async def _chat(self, prompt: str, temperature: float = 0.9) -> str:
+        """Call 1min.ai Chat with AI endpoint and return the text result."""
+        payload = {
+            "type": "UNIFY_CHAT_WITH_AI",
+            "model": self.model,
+            "promptObject": {
+                "prompt": prompt,
+                "settings": {
+                    "withMemories": False,
+                    "historySettings": {"isMixed": False, "historyMessageLimit": 10},
+                    "webSearchSettings": {"maxWord": 1000, "numOfSite": 3, "webSearch": False},
+                },
+                "attachments": {"files": [], "images": []},
+            },
+        }
+        async with httpx.AsyncClient(timeout=120.0, trust_env=True) as client:
+            response = await client.post(
+                "https://api.1min.ai/api/chat-with-ai",
+                headers={"Content-Type": "application/json", "API-KEY": self.api_key},
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        result_list = data.get("aiRecord", {}).get("aiRecordDetail", {}).get("resultObject", [])
+        return result_list[0] if result_list else ""
+
+    def _parse_json(self, content: str) -> list[dict[str, Any]]:
+        """Extract and parse a JSON array from LLM text output."""
+        content = content.strip()
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        return json.loads(content)
     
     async def generate_user_profiles(self, count: int) -> list[dict[str, Any]]:
         """Generate diverse user profiles with realistic names and roles."""
@@ -59,21 +90,8 @@ Requirements:
 - Email prefix should be firstname.lastname format
 - No duplicate names
 """
-        
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
-        )
-        
-        content = response.choices[0].message.content.strip()
-        # Extract JSON from potential markdown code blocks
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        return json.loads(content)
+        content = await self._chat(prompt)
+        return self._parse_json(content)
     
     async def generate_jira_stories(
         self, 
@@ -106,20 +124,8 @@ Requirements:
 - No generic or duplicate stories
 - Focus on real fintech payment challenges
 """
-        
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
-        )
-        
-        content = response.choices[0].message.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        return json.loads(content)
+        content = await self._chat(prompt)
+        return self._parse_json(content)
     
     async def generate_jira_bugs(
         self, 
@@ -149,20 +155,8 @@ Requirements:
 - Include impact on business/customers
 - Technical details (database locks, API errors, network issues, etc.)
 """
-        
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
-        )
-        
-        content = response.choices[0].message.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        return json.loads(content)
+        content = await self._chat(prompt)
+        return self._parse_json(content)
     
     async def generate_servicenow_incidents(
         self, 
@@ -190,20 +184,8 @@ Requirements:
 - Include detection method (alerts, customer reports, monitoring)
 - Add mitigation/resolution steps taken
 """
-        
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
-        )
-        
-        content = response.choices[0].message.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        return json.loads(content)
+        content = await self._chat(prompt)
+        return self._parse_json(content)
     
     async def generate_splunk_logs(
         self, 
@@ -229,20 +211,8 @@ Requirements:
 - For warnings: include threshold values, queue depths, latency numbers
 - Use actual technical terminology (circuit breaker, retry policy, connection pool, etc.)
 """
-        
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
-        )
-        
-        content = response.choices[0].message.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        return json.loads(content)
+        content = await self._chat(prompt)
+        return self._parse_json(content)
     
     async def generate_deployments(
         self,
@@ -268,20 +238,8 @@ Requirements:
 - Proper semantic versioning
 - Mix of features, bug fixes, and infrastructure changes
 """
-        
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.8,
-        )
-        
-        content = response.choices[0].message.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        return json.loads(content)
+        content = await self._chat(prompt, temperature=0.8)
+        return self._parse_json(content)
 
 
 async def generate_enhanced_test_data(
@@ -295,14 +253,14 @@ async def generate_enhanced_test_data(
     reset: bool = False,
 ) -> dict[str, Any]:
     """Generate enhanced test data using LLM."""
-    
+
     if reset:
         reset_demo_data()
-    
+
     init_db()
     db = SessionLocal()
     generator = LLMTestDataGenerator(seed=seed)
-    
+
     try:
         result = {
             "jira_stories": 0,
@@ -313,11 +271,11 @@ async def generate_enhanced_test_data(
             "splunk_logs": 0,
             "users": 0,
         }
-        
+
         # Generate users if needed
         existing_users = db.query(JiraUser).all()
         users = existing_users
-        
+
         if jira_stories > 0 or jira_bugs > 0:
             users_needed = max(10, len(existing_users))
             if len(existing_users) < users_needed:
@@ -334,15 +292,22 @@ async def generate_enhanced_test_data(
                     db.add(user)
                     users.append(user)
                 
-                db.flush()
+                db.commit()
+                db.refresh(users[-1])  # ensure IDs are available
+                users = db.query(JiraUser).all()
                 result["users"] = users_needed - len(existing_users)
-        
+                print(f"  Committed {result['users']} users to DB.")
+
         # Generate JIRA stories
         if jira_stories > 0:
             print(f"Generating {jira_stories} JIRA stories with LLM...")
             existing_story_keys = [s.story_key for s in db.query(JiraStory.story_key).all()]
-            story_data = await generator.generate_jira_stories(jira_stories, existing_story_keys, users)
-            
+
+            # Batch stories in groups of 10
+            STORY_BATCH = 10
+            remaining = jira_stories
+            batch_num = 0
+
             # Create sprints if needed
             sprint_names = []
             if jira_sprints > 0:
@@ -361,39 +326,56 @@ async def generate_enhanced_test_data(
                     db.add(sprint)
                     sprint_names.append(sprint.sprint_name)
                     result["jira_sprints"] += 1
+                db.commit()
+                print(f"  Committed {result['jira_sprints']} sprints to DB.")
             
             story_counter = len(existing_story_keys) + 1
-            created_stories = []
             
-            for story_info in story_data:
-                story = JiraStory(
-                    story_key=f"PAY-{story_counter:04d}",
-                    title=story_info["title"][:200],
-                    description=story_info["description"],
-                    assignee_id=random.choice(users).id,
-                    reporter_id=random.choice(users).id,
-                    story_points=story_info["story_points"],
-                    priority=story_info["priority"],
-                    sprint=random.choice(sprint_names) if sprint_names else "Backlog",
-                    status=story_info["status"],
-                )
-                db.add(story)
-                created_stories.append(story)
-                story_counter += 1
-                result["jira_stories"] += 1
-            
-            db.flush()
-        
+            while remaining > 0:
+                batch = min(STORY_BATCH, remaining)
+                batch_num += 1
+                print(f"  Batch {batch_num}: generating {batch} stories ({jira_stories - remaining + batch}/{jira_stories})...")
+                try:
+                    batch_data = await generator.generate_jira_stories(batch, existing_story_keys, users)
+                except (httpx.ReadTimeout, httpx.ConnectTimeout):
+                    print(f"    Timeout, skipping batch.")
+                    remaining -= batch
+                    continue
+
+                for story_info in batch_data:
+                    story = JiraStory(
+                        story_key=f"PAY-{story_counter:04d}",
+                        title=story_info["title"][:200],
+                        description=story_info["description"],
+                        assignee_id=random.choice(users).id,
+                        reporter_id=random.choice(users).id,
+                        story_points=story_info["story_points"],
+                        priority=story_info["priority"],
+                        sprint=random.choice(sprint_names) if sprint_names else "Backlog",
+                        status=story_info["status"],
+                    )
+                    db.add(story)
+                    story_counter += 1
+                    result["jira_stories"] += 1
+
+                db.commit()
+                print(f"    Committed {len(batch_data)} stories to DB (total: {result['jira_stories']}).")
+                remaining -= batch
+
         # Generate JIRA bugs
         if jira_bugs > 0:
             print(f"Generating {jira_bugs} JIRA bugs with LLM...")
             existing_bug_keys = [b.bug_key for b in db.query(JiraBug.bug_key).all()]
             all_stories = db.query(JiraStory).all()
-            
-            bug_data = await generator.generate_jira_bugs(jira_bugs, existing_bug_keys, all_stories, users)
-            
+
+            try:
+                bug_data = await generator.generate_jira_bugs(jira_bugs, existing_bug_keys, all_stories, users)
+            except (httpx.ReadTimeout, httpx.ConnectTimeout):
+                print("    Timeout generating bugs, skipping.")
+                bug_data = []
+
             bug_counter = len(existing_bug_keys) + 1
-            
+
             for bug_info in bug_data:
                 related_story = random.choice(all_stories) if all_stories and random.random() > 0.5 else None
                 
@@ -410,38 +392,61 @@ async def generate_enhanced_test_data(
                 db.add(bug)
                 bug_counter += 1
                 result["jira_bugs"] += 1
-        
+
+            if bug_data:
+                db.commit()
+                print(f"  Committed {result['jira_bugs']} bugs to DB.")
+
         # Generate ServiceNow incidents
         if servicenow_incidents > 0:
             print(f"Generating {servicenow_incidents} ServiceNow incidents with LLM...")
             existing_incident_keys = [i.incident_id for i in db.query(ServiceNowIncident).all()]
-            
-            incident_data = await generator.generate_servicenow_incidents(servicenow_incidents, existing_incident_keys)
-            
+
+            INCIDENT_BATCH = 10
             incident_counter = len(existing_incident_keys) + 1
-            
-            for incident_info in incident_data:
-                incident = ServiceNowIncident(
-                    incident_id=f"INC{incident_counter:06d}",
-                    title=incident_info["title"][:200],
-                    description=incident_info["description"],
-                    severity=incident_info["severity"],
-                    status=incident_info["status"],
-                    assigned_group=incident_info["assigned_group"],
-                )
-                db.add(incident)
-                incident_counter += 1
-                result["servicenow_incidents"] += 1
-        
+            remaining = servicenow_incidents
+            batch_num = 0
+            while remaining > 0:
+                batch = min(INCIDENT_BATCH, remaining)
+                batch_num += 1
+                print(f"  Batch {batch_num}: generating {batch} incidents ({servicenow_incidents - remaining + batch}/{servicenow_incidents})...")
+                try:
+                    batch_data = await generator.generate_servicenow_incidents(batch, existing_incident_keys)
+                except (httpx.ReadTimeout, httpx.ConnectTimeout):
+                        print(f"    Timeout, skipping batch.")
+                    remaining -= batch
+                    continue
+
+                for incident_info in batch_data:
+                    incident = ServiceNowIncident(
+                        incident_id=f"INC{incident_counter:06d}",
+                        title=incident_info["title"][:200],
+                        description=incident_info["description"],
+                        severity=incident_info["severity"],
+                        status=incident_info["status"],
+                        assigned_group=incident_info["assigned_group"],
+                    )
+                    db.add(incident)
+                    incident_counter += 1
+                    result["servicenow_incidents"] += 1
+
+                db.commit()
+                print(f"    Committed {len(batch_data)} incidents to DB (total: {result['servicenow_incidents']}).")
+                remaining -= batch
+
         # Generate ServiceNow deployments
         if servicenow_deployments > 0:
             print(f"Generating {servicenow_deployments} ServiceNow deployments with LLM...")
             existing_deployment_keys = [d.deployment_id for d in db.query(ServiceNowDeployment).all()]
-            
-            deployment_data = await generator.generate_deployments(servicenow_deployments, existing_deployment_keys)
-            
+
+            try:
+                deployment_data = await generator.generate_deployments(servicenow_deployments, existing_deployment_keys)
+            except (httpx.ReadTimeout, httpx.ConnectTimeout):
+                print("    Timeout generating deployments, skipping.")
+                deployment_data = []
+
             deployment_counter = len(existing_deployment_keys) + 1
-            
+
             for deployment_info in deployment_data:
                 deployment = ServiceNowDeployment(
                     deployment_id=f"DEPLOY{deployment_counter:06d}",
@@ -454,27 +459,53 @@ async def generate_enhanced_test_data(
                 db.add(deployment)
                 deployment_counter += 1
                 result["servicenow_deployments"] += 1
-        
+
+            if deployment_data:
+                db.commit()
+
+                print(f"  Committed {result['servicenow_deployments']} deployments to DB.")
+
         # Generate Splunk logs
         if splunk_logs > 0:
             print(f"Generating {splunk_logs} Splunk logs with LLM...")
-            
-            log_data = await generator.generate_splunk_logs(splunk_logs)
-            
+
+            BATCH_SIZE = 10
             now = datetime.utcnow()
+            remaining = splunk_logs
+            batch_num = 0
             
-            for log_info in log_data:
-                log = SplunkLog(
-                    source=log_info["source"],
-                    level=log_info["level"],
-                    message=log_info["message"],
-                    service=log_info["service"],
-                    timestamp=now - timedelta(minutes=random.randint(0, 60 * 24 * 30)),
-                )
-                db.add(log)
-                result["splunk_logs"] += 1
-        
-        db.commit()
+            while remaining > 0:
+                batch = min(BATCH_SIZE, remaining)
+                batch_num += 1
+                print(f"  Batch {batch_num}: generating {batch} logs ({splunk_logs - remaining + batch}/{splunk_logs})...")
+                for attempt in range(3):
+                    try:
+                        log_data = await generator.generate_splunk_logs(batch)
+                        break
+                    except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                        if attempt < 2:
+                            print(f"    Timeout, retrying ({attempt + 2}/3)...")
+                            await asyncio.sleep(2)
+                        else:
+                            print(f"    Skipping batch after 3 timeouts.")
+                            log_data = []
+
+                for log_info in log_data:
+                    log = SplunkLog(
+                        source=log_info["source"],
+                        level=log_info["level"],
+                        message=log_info["message"],
+                        service=log_info["service"],
+                        timestamp=now - timedelta(minutes=random.randint(0, 60 * 24 * 30)),
+                    )
+                    db.add(log)
+                    result["splunk_logs"] += 1
+
+                if log_data:
+                    db.commit()
+                    print(f"    Committed {len(log_data)} logs to DB (total: {result['splunk_logs']}).")
+                remaining -= batch
+
         return result
         
     except Exception as e:
@@ -511,12 +542,12 @@ def main():
     
     # Handle quick mode
     if args.quick:
-        args.jira_stories = 10
-        args.jira_bugs = 5
-        args.jira_sprints = 2
-        args.servicenow_incidents = 8
-        args.servicenow_deployments = 6
-        args.splunk_logs = 15
+        args.jira_stories = 25
+        args.jira_bugs = 10
+        args.jira_sprints = 4
+        args.servicenow_incidents = 30
+        args.servicenow_deployments = 15
+        args.splunk_logs = 200
     # Handle legacy arguments
     elif args.jira_data > 0 or args.servicenow_data > 0 or args.splunk_data > 0:
         if args.jira_data > 0:

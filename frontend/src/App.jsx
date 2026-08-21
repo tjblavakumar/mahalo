@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import Markdown from 'react-markdown';
 import { getPersonas, getSystemStatus, resetDemoData, sendMessage } from './services/api';
 
 const starterMessages = [
@@ -139,7 +140,7 @@ function App() {
                   <strong>{message.role === 'assistant' ? 'MAHALO' : message.persona || persona}</strong>
                   {message.agent && <span>{message.agent}</span>}
                 </div>
-                <p>{message.content}</p>
+                <div className="message-content"><Markdown>{message.content.replace(/\n/g, '  \n')}</Markdown></div>
               </div>
             </article>
           ))}

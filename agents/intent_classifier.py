@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 
 INTENT_SCHEMA = {
     "intent": (
-        "One of: greeting, executive_overview, analyze_errors, suggest_features, count_deployments, "
-        "check_velocity, story_detail, create_story, confirm_create_story, review_pending_stories, "
-        "write_test_case, incident_status, update_story, general_sdlc"
+        "One of: greeting, executive_overview, analyze_errors, suggest_features, suggest_work_item, "
+        "count_deployments, check_velocity, story_detail, create_story, confirm_create_story, "
+        "review_pending_stories, write_test_case, incident_status, update_story, general_sdlc"
     ),
     "agents": ["JIRA Agent", "ServiceNow Agent", "Splunk Agent"],
     "entities": {"story_key": "optional STORY-* or PROJ-* key", "environment": "optional environment"},
@@ -56,6 +56,18 @@ FEW_SHOT_EXAMPLES = [
      "entities": {"story_key": "STORY-3", "update_fields": {"priority": "Critical"}}, "requires_confirmation": True, "confidence": 0.9},
     {"query": "update STORY-8 status to Done", "intent": "update_story", "agents": ["JIRA Agent"],
      "entities": {"story_key": "STORY-8", "update_fields": {"status": "Done"}}, "requires_confirmation": True, "confidence": 0.9},
+    {"query": "which is the easy bug to fix", "intent": "suggest_work_item", "agents": ["JIRA Agent"],
+     "requires_confirmation": False, "confidence": 0.85},
+    {"query": "suggest a low effort story to pick up", "intent": "suggest_work_item", "agents": ["JIRA Agent"],
+     "requires_confirmation": False, "confidence": 0.85},
+    {"query": "what would be the story points for the pool size issue", "intent": "story_detail", "agents": ["JIRA Agent"],
+     "requires_confirmation": False, "confidence": 0.8},
+    {"query": "how much effort is the timeout fix", "intent": "story_detail", "agents": ["JIRA Agent"],
+     "requires_confirmation": False, "confidence": 0.8},
+    {"query": "list all bugs and estimate story points for each", "intent": "analyze_errors", "agents": ["JIRA Agent"],
+     "requires_confirmation": False, "confidence": 0.85},
+    {"query": "look at jira bugs and tell me the effort for each", "intent": "analyze_errors", "agents": ["JIRA Agent"],
+     "requires_confirmation": False, "confidence": 0.85},
 ]
 
 SYSTEM_PROMPT = (
@@ -71,11 +83,12 @@ ALLOWED_INTENTS = {
     "analyze_errors", "suggest_features", "count_deployments", "check_velocity",
     "story_detail", "create_story", "confirm_create_story", "review_pending_stories",
     "write_test_case", "incident_status", "executive_overview", "greeting", "general_sdlc",
-    "update_story",
+    "update_story", "suggest_work_item",
 }
 
 # Below this confidence, prefer the deterministic keyword fallback over the LLM's guess.
-CONFIDENCE_THRESHOLD = 0.55
+# Only used if the fallback also has higher confidence than the LLM.
+CONFIDENCE_THRESHOLD = 0.4
 
 # History turns are truncated to keep prompts small; only recent context matters for follow-ups.
 MAX_HISTORY_TURNS = 6
@@ -100,12 +113,24 @@ class IntentClassifier:
                 temperature=0,
                 max_tokens=220,
             )
-            parsed = json.loads(response.choices[0].message.content)
+            content = response.choices[0].message.content.strip()
+            # Strip markdown code blocks if present
+            if content.startswith("```"):
+                content = content.split("```json")[-1] if "```json" in content else content.split("```")[1]
+                content = content.split("```")[0].strip()
+            parsed = json.loads(content)
             validated = self._validate(parsed, fallback)
+            # Use fallback if: (1) LLM confidence is very low, OR (2) fallback has much higher confidence
             if validated["confidence"] < CONFIDENCE_THRESHOLD:
                 logger.info(
                     "Low-confidence LLM intent %r (%.2f) for query=%r; using fallback intent %r",
                     validated["intent"], validated["confidence"], query, fallback["intent"],
+                )
+                return fallback
+            if fallback["confidence"] - validated["confidence"] >= 0.3:
+                logger.info(
+                    "Fallback intent %r (%.2f) much stronger than LLM %r (%.2f) for query=%r",
+                    fallback["intent"], fallback["confidence"], validated["intent"], validated["confidence"], query,
                 )
                 return fallback
             return validated
@@ -196,6 +221,21 @@ class IntentClassifier:
             return self._result("check_velocity", ["JIRA Agent"])
         if any(term in query for term in ("analyze", "analyse", "based on")) and any(term in query for term in ("error", "log", "story", "feature")):
             return self._result("analyze_errors", ["JIRA Agent", "Splunk Agent"])
+        # Suggest work item — user wants a recommendation on what to pick up next
+        if any(term in query for term in ("easy", "simple", "quick", "low effort", "small", "starter", "beginner", "pick up", "work on", "start with")) and any(
+            term in query for term in ("bug", "story", "issue", "task", "fix", "ticket", "item", "suggest", "recommend")
+        ):
+            return self._result("suggest_work_item", ["JIRA Agent"], confidence=0.85)
+        if any(term in query for term in ("suggest", "recommend", "which")) and any(
+            term in query for term in ("easy", "simple", "quick", "low", "small", "first", "next")
+        ) and any(term in query for term in ("bug", "story", "issue", "task", "fix", "ticket", "work")):
+            return self._result("suggest_work_item", ["JIRA Agent"], confidence=0.8)
+        # Broader error/log analysis detection for natural language queries
+        # Exclude "easy/simple to fix" patterns which are work-item suggestions, not error analysis
+        if any(term in query for term in ("log", "logs", "error", "errors", "issue", "issues", "failure", "failures")) and any(
+            term in query for term in ("priority", "high priority", "critical", "important", "urgent", "address", "fix", "resolve", "investigate", "check", "read", "show", "tell me", "what are")
+        ) and not any(term in query for term in ("easy", "simple", "quick", "low effort", "pick up", "work on", "suggest me", "recommend")):
+            return self._result("analyze_errors", ["Splunk Agent", "JIRA Agent"])
         if "incident" in query or "outage" in query:
             return self._result("incident_status", ["ServiceNow Agent"])
         return self._result("general_sdlc", ["JIRA Agent", "ServiceNow Agent", "Splunk Agent"], confidence=0.3)

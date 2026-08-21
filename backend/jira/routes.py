@@ -26,6 +26,17 @@ class JiraStoryCreate(BaseModel):
     status: str = "Backlog"
 
 
+class JiraStoryUpdate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    assignee_username: str | None = None
+    reporter_username: str | None = None
+    story_points: int | None = None
+    priority: str | None = None
+    sprint: str | None = None
+    status: str | None = None
+
+
 @router.get("/users")
 def list_users(db: Session = Depends(get_db)):
     return {"items": JiraService.list_all_users(db)}
@@ -74,6 +85,27 @@ def get_story(story_key: str, db: Session = Depends(get_db)):
         "status": story.status,
         "priority": story.priority,
         "sprint": story.sprint,
+        "assignee_username": story.assignee.username if story.assignee else None,
+        "reporter_username": story.reporter.username if story.reporter else None,
+    }
+
+
+@router.patch("/stories/{story_key}")
+def update_story(story_key: str, payload: JiraStoryUpdate, db: Session = Depends(get_db)):
+    update_fields = payload.model_dump(exclude_unset=True)
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    story = JiraService.update_story(db, story_key, **update_fields)
+    if not story:
+        raise HTTPException(status_code=404, detail="Story not found")
+    return {
+        "story_key": story.story_key,
+        "title": story.title,
+        "description": story.description,
+        "status": story.status,
+        "priority": story.priority,
+        "sprint": story.sprint,
+        "story_points": story.story_points,
         "assignee_username": story.assignee.username if story.assignee else None,
         "reporter_username": story.reporter.username if story.reporter else None,
     }

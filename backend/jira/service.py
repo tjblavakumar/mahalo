@@ -75,6 +75,44 @@ class JiraService:
         return db.query(JiraStory).filter(JiraStory.story_key == story_key).first()
 
     @staticmethod
+    def update_story(
+        db: Session,
+        story_key: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        assignee_username: Optional[str] = None,
+        reporter_username: Optional[str] = None,
+        story_points: Optional[int] = None,
+        priority: Optional[str] = None,
+        sprint: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Optional[JiraStory]:
+        story = db.query(JiraStory).filter(JiraStory.story_key == story_key).first()
+        if not story:
+            return None
+        if title is not None:
+            story.title = title
+        if description is not None:
+            story.description = description
+        if story_points is not None:
+            story.story_points = story_points
+        if priority is not None:
+            story.priority = priority
+        if sprint is not None:
+            story.sprint = sprint
+        if status is not None:
+            story.status = status
+        if assignee_username is not None:
+            assignee = JiraService.get_user_by_username(db, assignee_username)
+            story.assignee_id = assignee.id if assignee else None
+        if reporter_username is not None:
+            reporter = JiraService.get_user_by_username(db, reporter_username)
+            story.reporter_id = reporter.id if reporter else None
+        db.commit()
+        db.refresh(story)
+        return story
+
+    @staticmethod
     def list_all_stories(db: Session, limit: int = 100) -> List[JiraStory]:
         return db.query(JiraStory).limit(limit).all()
 

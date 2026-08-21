@@ -83,7 +83,19 @@ function App() {
               <button
                 className={`persona-option ${persona === item.id ? 'selected' : ''}`}
                 key={item.id}
-                onClick={() => setPersona(item.id)}
+                onClick={() => {
+                  if (item.id !== persona) {
+                    setPersona(item.id);
+                    setConversationId(null);
+                    setMessages([
+                      {
+                        role: 'assistant',
+                        content: `Switched to ${item.name} lens. How can I help?`,
+                        agent: 'Orchestrator',
+                      },
+                    ]);
+                  }
+                }}
                 type="button"
               >
                 <span className="persona-dot" />

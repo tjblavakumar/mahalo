@@ -77,3 +77,18 @@ class JiraMCPTools:
             return {"success": True, "data": payload}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    async def update_story_handler(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        story_key = arguments.pop("story_key", None)
+        if not story_key:
+            return {"success": False, "error": "story_key is required"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0, trust_env=True) as client:
+                response = await client.patch(
+                    f"{self.jira_api_url}/api/jira/stories/{story_key}",
+                    json=arguments,
+                )
+                response.raise_for_status()
+                return {"success": True, "data": response.json()}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}

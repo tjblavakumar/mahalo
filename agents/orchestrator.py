@@ -3,9 +3,10 @@ import re
 from asyncio import gather
 from typing import Any
 
-from litellm import completion
+from litellm import completion as _litellm_completion
 
 from backend.config import settings
+from backend.llm_adapter import one_min_ai_completion
 from agents.jira_agent import JiraAgent
 from agents.servicenow_agent import ServiceNowAgent
 from agents.splunk_agent import SplunkAgent
@@ -15,6 +16,23 @@ from agents.correlation_engine import CorrelationEngine
 
 class OrchestratorAgent:
     """Simple orchestrator that uses the configured LLM provider."""
+
+    # Intents that skip the interpretation/confirmation layer
+    _SKIP_CONFIRMATION_INTENTS = frozenset({
+        "greeting", "review_pending_stories", "confirm_create_story",
+    })
+
+    # Keywords that indicate the user is confirming a pending action
+    _CONFIRMATION_KEYWORDS = frozenset({
+        "yes", "yeah", "yep", "sure", "go ahead", "proceed", "do it",
+        "ok", "okay", "confirm", "approved", "approve", "correct",
+    })
+
+    # Keywords that indicate the user is rejecting a pending action
+    _REJECTION_KEYWORDS = frozenset({
+        "no", "nope", "cancel", "nevermind", "never mind", "stop",
+        "don't", "do not", "scratch that", "forget it", "skip",
+    })
 
     def __init__(self, jira_agent=None, servicenow_agent=None, splunk_agent=None):
         self.jira_agent = jira_agent or JiraAgent()
@@ -27,6 +45,247 @@ class OrchestratorAgent:
         self.last_intent: dict[str, Any] = {}
         self.correlation_engine = CorrelationEngine()
         self.last_insights: dict[str, Any] = {}
+        # Interpretation layer state
+        self.pending_action: dict[str, Any] | None = None
+
+    # ===== INTERPRETATION LAYER HELPERS =====
+
+    def _is_user_confirming(self, query: str) -> bool:
+        """Check if the user message is a confirmation of a pending action."""
+        normalized = query.strip().lower().rstrip("!?.")
+        # Direct match on short confirmations
+        if normalized in self._CONFIRMATION_KEYWORDS:
+            return True
+        # Check if any confirmation phrase appears at the start
+        return any(normalized.startswith(kw) for kw in self._CONFIRMATION_KEYWORDS)
+
+    def _is_user_rejecting(self, query: str) -> bool:
+        """Check if the user message is a rejection of a pending action."""
+        normalized = query.strip().lower().rstrip("!?.")
+        if normalized in self._REJECTION_KEYWORDS:
+            return True
+        return any(normalized.startswith(kw) for kw in self._REJECTION_KEYWORDS)
+
+    def _build_interpretation_message(self, persona: str, intent: dict[str, Any], query: str) -> str:
+        """Build a human-readable interpretation of what the orchestrator understands."""
+        intent_name = intent.get("intent", "general_sdlc")
+        agents = intent.get("agents", [])
+        confidence = intent.get("confidence", 0.5)
+
+        # Map intent to human-readable description
+        intent_descriptions = {
+            "executive_overview": "get a high-level executive overview of the project",
+            "analyze_errors": "analyze production errors and failure patterns",
+            "suggest_features": "suggest features or stories based on production signals",
+            "count_deployments": "check what has been deployed to production",
+            "check_velocity": "review team velocity and sprint progress",
+            "story_detail": "look up details for a specific JIRA story",
+            "create_story": "create a new JIRA story",
+            "write_test_case": "write a test case for a story",
+            "incident_status": "check the current incident status",
+            "update_story": "update an existing JIRA story",
+            "general_sdlc": "answer a general question about the delivery lifecycle",
+        }
+
+        description = intent_descriptions.get(intent_name, f"help with: {intent_name}")
+        agents_text = ", ".join(agents) if agents else "my built-in knowledge"
+        entity_info = ""
+        entities = intent.get("entities", {})
+        if entities.get("story_key"):
+            entity_info = f" (targeting {entities['story_key']})"
+
+        confidence_note = ""
+        if confidence < 0.7:
+            confidence_note = " Let me know if I've misunderstood."
+
+        # Special formatting for update_story to show planned changes
+        if intent_name == "update_story" and entities.get("update_fields"):
+            fields_desc = ", ".join(f"{k} → {v}" for k, v in entities["update_fields"].items())
+            return (
+                f"{persona}, here's what I understand:\n\n"
+                f"**Your request:** {query}\n"
+                f"**My interpretation:** You want to update {entities.get('story_key', 'a story')}: {fields_desc}.\n"
+                f"**I'll consult:** {agents_text}\n\n"
+                f"Shall I proceed?{confidence_note}"
+            )
+
+        return (
+            f"{persona}, here's what I understand:\n\n"
+            f"**Your request:** {query}\n"
+            f"**My interpretation:** You want to {description}{entity_info}.\n"
+            f"**I'll consult:** {agents_text}\n\n"
+            f"Shall I proceed?{confidence_note}"
+        )
+
+    def _should_skip_confirmation(self, intent: dict[str, Any], user_query: str, conversation_history: list[dict[str, str]] | None) -> bool:
+        """Determine if this query should bypass the interpretation layer."""
+        intent_name = intent.get("intent", "")
+        # Always skip for exempt intents
+        if intent_name in self._SKIP_CONFIRMATION_INTENTS:
+            return True
+        # Skip if there's already a pending action (we're in confirmation flow)
+        if self.pending_action:
+            return True
+        # Skip for follow-up on pending stories (elaborate, expand, etc.)
+        user_query_lower = user_query.lower()
+        if self.pending_stories and any(
+            term in user_query_lower for term in (
+                "elaborate", "expand", "acceptance criteria", "complete details",
+                "review", "suggested use case", "suggested stories",
+            )
+        ):
+            return True
+        # Skip for explicit JIRA write confirmations (handled by existing logic)
+        if self.pending_stories and (
+            intent_name == "confirm_create_story"
+            or (
+                "jira" in user_query_lower
+                and any(action in user_query_lower for action in ("create", "save", "write", "add"))
+            )
+        ):
+            return True
+        return False
+
+    async def _execute_confirmed_action(self, action: dict[str, Any]) -> str:
+        """Execute a previously confirmed action by re-running process_query with confirmation bypass."""
+        persona = action["persona"]
+        query = action["query"]
+        intent = action["intent"]
+        history = action.get("conversation_history")
+
+        # Set the intent so the downstream logic uses it
+        self.last_intent = intent
+
+        # Now execute the core logic that was deferred
+        user_query_lower = query.lower()
+
+        # Handle update_story intent
+        if intent.get("intent") == "update_story":
+            entities = intent.get("entities", {})
+            story_key = entities.get("story_key")
+            update_fields = entities.get("update_fields", {})
+            if story_key and update_fields:
+                result = await self.jira_agent.update_story(story_key, update_fields)
+                if result.get("success"):
+                    updated_data = result.get("data", {})
+                    return f"{persona}, done. {story_key} has been updated: {', '.join(f'{k}={v}' for k, v in update_fields.items())}."
+                return f"{persona}, the update failed: {result.get('error', 'unknown error')}."
+            return f"{persona}, I couldn't determine which story to update or what fields to change. Could you clarify?"
+
+        # Follow-up on pending stories
+        follow_up = (
+            self.pending_stories and
+            any(term in user_query_lower for term in (
+                "suggested use case", "suggested stories", "complete details",
+                "acceptance criteria", "expand", "review"
+            ))
+        ) or (
+            "elaborate" in user_query_lower and
+            ("story" in user_query_lower or "stories" in user_query_lower) and
+            self.pending_stories
+        ) or (
+            self.pending_stories and intent.get("intent") == "review_pending_stories"
+        )
+
+        review_first = any(term in user_query_lower for term in ("review", "before you create", "before creating", "do not create", "don't create", "first"))
+        explicit_jira_write = not review_first and (
+            (
+                "jira" in user_query_lower and
+                any(action_term in user_query_lower for action_term in ("create", "save", "write", "add"))
+            ) or intent.get("intent") == "confirm_create_story"
+        )
+
+        if (follow_up or explicit_jira_write) and self.pending_stories:
+            if explicit_jira_write:
+                results = [await self.jira_agent.create_story(story) for story in self.pending_stories]
+                created = [r.get("data", {}).get("story_key", "new story") for r in results if r.get("success")]
+                if len(created) == len(results):
+                    self.pending_stories = []
+                    return f"{persona}, created {len(created)} stories in JIRA: {', '.join(created)}."
+                return f"{persona}, created {len(created)} stories, but some writes failed."
+            if any(term in user_query_lower for term in ("elaborate", "expand")):
+                selected_story = self._select_pending_story(query)
+                if "priority" in user_query_lower:
+                    return self._format_priority_explanation(persona, selected_story)
+                return self._format_story_draft(persona, selected_story)
+            return self._format_story_drafts(persona, self.pending_stories)
+
+        # Retrieve context and produce response
+        context_query = "executive overview" if self._is_top_issue_request(query) else query
+        context_intent = (
+            {"agents": ["JIRA Agent", "ServiceNow Agent", "Splunk Agent"]}
+            if self._is_top_issue_request(query)
+            else intent
+        )
+        agents_used, contexts = await self.retrieve_context(context_query, context_intent)
+
+        # Correlation
+        insights = self.correlation_engine.correlate_contexts(contexts)
+        self.last_insights = insights
+
+        if self._is_top_issue_request(query):
+            priorities = insights.get("priorities", [])
+            if priorities:
+                top = priorities[0]
+                incident = f" ({top['incident_id']})" if top.get("incident_id") else ""
+                return (
+                    f"{persona}, the top issue is {top.get('theme', 'the highest-priority issue')}{incident}.\n"
+                    f"Why: {top.get('reason', 'It has the highest current impact.')}\n"
+                    f"Priority: {top.get('suggested_priority', 'High')}\n"
+                    f"Estimated effort: {top.get('story_points_estimate', 'Not estimated')} story points."
+                )
+            return f"{persona}, I could not identify a current top issue from the available project data."
+
+        # Story analysis / suggestion
+        if ("analyze" in user_query_lower or "analyse" in user_query_lower) and ("story" in user_query_lower or "stories" in user_query_lower):
+            self.pending_stories = self._draft_stories_from_context(contexts)
+        if ("suggest" in user_query_lower or "recommend" in user_query_lower) and ("story" in user_query_lower or "stories" in user_query_lower):
+            self.pending_stories = self._draft_stories_from_context(contexts)
+        if follow_up or (("create" in user_query_lower or "stories" in user_query_lower) and "story" in user_query_lower and self.last_contexts):
+            wants_multiple = "stories" in user_query_lower or "these user stories" in user_query_lower
+            self.pending_stories = self._draft_stories_from_context(self.last_contexts) if wants_multiple else [self._story_from_context(self.last_contexts)]
+            return self._format_story_drafts(persona, self.pending_stories)
+
+        # LLM synthesis
+        context_text = json.dumps(contexts, default=str)
+        insights_text = self.correlation_engine.format_insights_for_llm()
+
+        if settings.ONE_MIN_AI_API_KEY:
+            try:
+                response = await one_min_ai_completion(
+                    model=settings.LITELLM_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are MAHALO's reasoning orchestrator. Interpret the user's underlying goal; "
+                                "do not treat every phrase as a literal search term or repeat empty tool results.\n"
+                                "Use the available evidence to answer the question directly, synthesize across tools, "
+                                "and explain uncertainty when the evidence is insufficient.\n\n"
+                                f"{self._role_system_instructions(persona)}\n\n"
+                                f"Classified intent: {intent.get('intent')} (confidence: {intent.get('confidence', 0.5)})\n\n"
+                                "Be specific, be analytical, be helpful. Don't just list data - interpret it!"
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Request: {query}\n\n"
+                                f"=== INTELLIGENT INSIGHTS (USE THIS FIRST) ===\n{insights_text}\n\n"
+                                f"=== RAW TOOL CONTEXT (FOR DETAILS) ===\n{context_text}"
+                            )
+                        },
+                    ],
+                    temperature=0.4,
+                    max_tokens=600,
+                )
+                llm_text = response.choices[0].message.content
+                if self._llm_response_is_grounded(query, llm_text, contexts):
+                    return llm_text
+            except Exception:
+                pass
+
+        return self._fallback_response(persona, query, contexts)
 
     def route_query(self, user_query: str) -> str:
         q = user_query.lower()
@@ -117,7 +376,7 @@ class OrchestratorAgent:
             f"{persona}, here is the complete JIRA story draft:\n\n"
             f"Title: {story['title']}\nDescription: {story['description']}\n"
             f"Priority: {story['priority']}\nStory points: {story['story_points']}\nSprint: {story['sprint']}\n"
-            f"User story: As a MahaloPay customer, I want {story['title'].lower()}, so that payment processing remains reliable.\n"
+            f"User story: As a MahaloPay customer, I want to {story['title'].lower()}, so that payment processing remains reliable.\n"
             f"Acceptance criteria:\n{criteria}\nEvidence:\n{evidence}\n\n"
             "This is still a draft. Say 'create this story in JIRA' to save it."
         )
@@ -128,6 +387,71 @@ class OrchestratorAgent:
             + "\n\n".join(self._format_story_draft(persona, story) for story in stories)
             + "\n\nNo stories have been created yet. Say 'create these stories in JIRA' after you approve them."
         )
+
+    @staticmethod
+    def _role_system_instructions(persona: str) -> str:
+        role_instructions = {
+            "Executive": (
+                "ROLE: Executive / VP-level stakeholder\n"
+                "DECISION FRAMEWORK: You make go/no-go decisions, allocate budget, escalate risks, "
+                "and set strategic priorities. You need to know: What is the business impact? "
+                "What is the risk if we do nothing? What is the cost of delay? Is this on track?\n"
+                "COMMUNICATION STYLE:\n"
+                "- Lead with a one-line status verdict (on-track / at-risk / blocked).\n"
+                "- Use traffic-light indicators: GREEN (healthy), AMBER (needs attention), RED (blocked/critical).\n"
+                "- Quantify with KPIs: revenue impact, customer-facing SLA, delivery velocity, defect escape rate.\n"
+                "- Keep technical detail to one sentence unless it changes the business decision.\n"
+                "- End with a clear recommendation or decision needed.\n"
+                "RELEVANT ACTIONS: escalate, deprioritize, fund, approve, request status update, set deadline."
+            ),
+            "Product Manager": (
+                "ROLE: Product Manager\n"
+                "DECISION FRAMEWORK: You prioritize the backlog, estimate effort, define acceptance criteria, "
+                "and balance customer value against engineering cost. You need to know: What should we build next? "
+                "What is the customer impact? How does this fit the roadmap? What are the dependencies?\n"
+                "COMMUNICATION STYLE:\n"
+                "- Frame findings as user stories or backlog recommendations.\n"
+                "- Provide impact/effort assessments (e.g., High Impact / Medium Effort).\n"
+                "- Include acceptance criteria when suggesting work items.\n"
+                "- Mention dependencies, risks, and sprint fit.\n"
+                "- Use story-point estimates with brief justification.\n"
+                "- Reference customer segments or personas affected.\n"
+                "RELEVANT ACTIONS: create stories, reprioritize backlog, define scope, estimate effort, "
+                "split epics, set acceptance criteria, schedule for sprint."
+            ),
+            "Developer": (
+                "ROLE: Software Developer / Engineer\n"
+                "DECISION FRAMEWORK: You need technical root cause, affected code paths, implementation options, "
+                "and trade-offs. You decide: What is the fix? What is the safest approach? "
+                "What are the edge cases? What tests should cover this?\n"
+                "COMMUNICATION STYLE:\n"
+                "- Lead with the technical root cause or diagnosis.\n"
+                "- Identify affected components, services, and code paths.\n"
+                "- Present implementation options with trade-offs (performance, complexity, risk).\n"
+                "- Include relevant log evidence, error patterns, and stack traces.\n"
+                "- Suggest concrete engineering next steps (PRs, config changes, architecture decisions).\n"
+                "- Mention edge cases and failure modes.\n"
+                "RELEVANT ACTIONS: investigate root cause, implement fix, refactor, add monitoring, "
+                "write unit tests, deploy hotfix, review architecture."
+            ),
+            "QA": (
+                "ROLE: QA Engineer / Test Lead\n"
+                "DECISION FRAMEWORK: You assess release readiness, regression risk, and test coverage. "
+                "You need to know: Can we reproduce this? What is the blast radius? "
+                "What tests are missing? Is this safe to release?\n"
+                "COMMUNICATION STYLE:\n"
+                "- Assess reproducibility and defect scope first.\n"
+                "- Identify regression scenarios and affected test suites.\n"
+                "- Present risk-based test coverage recommendations.\n"
+                "- Include expected vs. actual results for defects.\n"
+                "- Provide release-readiness verdicts with evidence.\n"
+                "- Suggest test matrices for new features or fixes.\n"
+                "RELEVANT ACTIONS: write test cases, flag regressions, assess release readiness, "
+                "define test scenarios, report defect severity, validate fixes, update test coverage."
+            ),
+        }
+        role = persona if persona in role_instructions else "Executive"
+        return f"=== ACTIVE PERSONA ===\n{role_instructions[role]}"
 
     def _draft_stories_from_context(self, contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         primary = self._story_from_context(contexts)
@@ -190,8 +514,42 @@ class OrchestratorAgent:
         }.get(story.get("priority", "Medium"), "Its priority is based on the observed production impact and delivery risk.")
         return f"{persona}, **{story['title']}** is marked {story['priority']} priority. {priority_reason} It is estimated at {story['story_points']} story points."
 
+    @staticmethod
+    def _estimate_story_points(story: dict[str, Any]) -> tuple[int, str]:
+        """Heuristic story-point estimate for stories JIRA has not yet sized."""
+        text = f"{story.get('title', '')} {story.get('description', '')}".lower()
+        priority = str(story.get("priority", "Medium")).lower()
+        low_complexity_terms = ("typo", "label", "copy change", "minor", "small tweak")
+        high_complexity_terms = (
+            "automation", "reconciliation", "integration", "migration",
+            "failover", "fraud", "security", "compliance", "settlement",
+        )
+        if any(term in text for term in low_complexity_terms):
+            return 2, "the description points to a small, low-risk change"
+        if any(term in text for term in high_complexity_terms) or priority == "high":
+            return 8, "it involves cross-system integration or high-priority production risk"
+        return 5, "it is a standard-scope backlog item without unusual complexity signals"
+
+    def _format_story_point_estimate(self, persona: str, story: dict[str, Any], story_key: str) -> str:
+        """Answer 'estimate the story points' requests, whether or not JIRA already has a value."""
+        key = story.get("story_key", story_key)
+        current_points = story.get("story_points") or 0
+        if current_points:
+            return f"{persona}, {key} is already estimated at {current_points} story points in JIRA."
+        points, reason = self._estimate_story_points(story)
+        return (
+            f"{persona}, {key} is not yet estimated in JIRA. Based on its title and description, "
+            f"I'd suggest **{points} story points** — {reason}. "
+            "This is a suggested estimate; confirm with the team before updating JIRA."
+        )
+
     # ===== BUG #1: FORMAT RESPONSE FIX =====
     
+    @staticmethod
+    def _contains_phrase(text: str, phrases: list[str]) -> bool:
+        """Whole-word/phrase match so short keywords (e.g. "how") don't match inside unrelated words (e.g. "show")."""
+        return any(re.search(rf"\b{re.escape(phrase)}\b", text) for phrase in phrases)
+
     def _is_formatting_request(self, query: str, conversation_history: list[dict[str, str]] | None = None) -> bool:
         """Detect if the query is a request to reformat/explain the previous response."""
         query_lower = query.lower()
@@ -207,8 +565,8 @@ class OrchestratorAgent:
             "that answer", "the answer", "the output", "your output", "that"
         ]
         
-        has_formatting = any(keyword in query_lower for keyword in formatting_keywords)
-        has_reference = any(ref in query_lower for ref in response_references)
+        has_formatting = self._contains_phrase(query_lower, formatting_keywords)
+        has_reference = self._contains_phrase(query_lower, response_references)
         
         is_short_formatting_query = (
             has_formatting and
@@ -322,8 +680,8 @@ class OrchestratorAgent:
             "that recommendation", "that score", "this score"
         ]
         
-        has_elaboration = any(keyword in query_lower for keyword in elaboration_keywords)
-        has_reference = any(ref in query_lower for ref in response_references)
+        has_elaboration = self._contains_phrase(query_lower, elaboration_keywords)
+        has_reference = self._contains_phrase(query_lower, response_references)
         
         is_short_elaboration = (
             has_elaboration and
@@ -469,13 +827,50 @@ class OrchestratorAgent:
         
         has_drafting = any(keyword in query_lower for keyword in drafting_keywords)
         has_story = any(term in query_lower for term in story_terms)
+
+        # Exclude test case requests — "write a test case for story X" is NOT story drafting
+        if "test case" in query_lower or "test scenario" in query_lower:
+            return False
+
+        # Exclude follow-up requests on pending stories (review/create existing drafts)
+        if self.pending_stories and any(
+            term in query_lower for term in ("review", "these stories", "these user stories", "before you create", "let me review")
+        ):
+            return False
         
         return has_drafting and has_story
 
     def _extract_story_topic(self, query: str) -> str:
         """Extract the specific topic/feature from the query."""
         query_lower = query.lower()
+
+        # 1. If the user references something they said earlier ("you said X", "you mentioned X"),
+        #    extract X as the topic directly. This handles queries like
+        #    "you said system health is critical. can you create a user story for me"
+        reference_match = re.search(
+            r"(?:you|as you)\s+(?:said|mentioned|noted|told me|indicated)\s+([^.!?]+)",
+            query_lower,
+        )
+        if reference_match:
+            topic = reference_match.group(1).strip(".:,;!? ").strip()
+            if topic and len(topic) >= 3:
+                return topic
+
+        # 2. Strip conversational preambles (e.g., "can you", "please", "i need")
+        preamble_patterns = [
+            r"^can you\s+",
+            r"^could you\s+",
+            r"^please\s+",
+            r"^would you\s+",
+            r"^do you think you can\s+",
+            r"^help me\s+",
+            r"^i (need|want|would like|am looking for|need you to)\s+",
+        ]
+        topic = query_lower
+        for pattern in preamble_patterns:
+            topic = re.sub(pattern, "", topic)
         
+        # 3. Strip known drafting prefixes
         prefixes = [
             "help me write a user story for",
             "help me write a story for",
@@ -493,18 +888,42 @@ class OrchestratorAgent:
             "this high priority item",
             "this",
         ]
-        
-        topic = query_lower
         for prefix in prefixes:
             topic = topic.replace(prefix, "").strip()
-        
+
+        # 4. Strip trailing filler words (e.g., "me", "for me", "please")
+        trailing_filler = r"\s*(please|for me|for us|me|thanks|thank you|now|then|ok|okay|right away|asap)?\s*[.!?]*$"
+        topic = re.sub(trailing_filler, "", topic)
+
+        # 5. Clean up remaining punctuation and whitespace
         topic = topic.strip(".:,;!?")
         topic = topic.strip()
-        
-        return topic if topic else None
+        # 6. Validate: reject empty or purely conversational topics
+        if not topic or len(topic) < 3:
+            return None
+        return topic
+
+    @staticmethod
+    def _extract_incident_id(query: str) -> str | None:
+        match = re.search(r"\bINC\d+\b", query, re.IGNORECASE)
+        return match.group(0).upper() if match else None
 
     def _draft_story_for_topic(self, persona: str, topic: str, contexts: list[dict[str, Any]]) -> str:
         """Draft a user story for a specific topic using relevant context."""
+        incident_id = self._extract_incident_id(topic)
+        incident = None
+        for context in contexts:
+            if context.get("source") != "ServiceNow" or not context.get("success"):
+                continue
+            data = context.get("data", {})
+            items = data.get("items", []) if isinstance(data, dict) else []
+            incident = next(
+                (item for item in items if str(item.get("incident_id", "")).upper() == incident_id),
+                None,
+            )
+            if incident:
+                break
+
         splunk_context = next((ctx for ctx in contexts if ctx.get("source") == "Splunk"), None)
         logs = []
         if splunk_context and splunk_context.get("success"):
@@ -520,16 +939,47 @@ class OrchestratorAgent:
         if not relevant_logs and logs:
             relevant_logs = logs
         
-        story = self._build_story_from_topic(topic, relevant_logs)
+        story = self._build_story_from_incident(incident, relevant_logs) if incident else self._build_story_from_topic(topic, relevant_logs)
         self.pending_stories = [story]
         
         return self._format_story_draft(persona, story)
 
+    def _build_story_from_incident(self, incident: dict[str, Any], logs: list[dict[str, Any]]) -> dict[str, Any]:
+        incident_id = incident.get("incident_id", "the incident")
+        title = incident.get("title", "production incident")
+        description = incident.get("description", "")
+        severity = str(incident.get("severity", "High")).title()
+        story_title = f"Resolve {title.lower()}"
+        acceptance_criteria = [
+            f"The cause of {incident_id} is identified and the payment service remains healthy during peak load",
+            "Payment API failures return a safe, actionable response without losing transactions",
+            "Monitoring alerts the Platform Reliability team before error rates impact customers",
+            "Staging and load tests cover the failure and recovery scenarios",
+            "Automated tests and operational documentation are updated",
+        ]
+        evidence = [f"{incident_id}: {title} ({severity}, {incident.get('status', 'Active')})"]
+        if description:
+            evidence.append(description)
+        evidence.extend(log.get("message", "") for log in logs[:3] if log.get("message"))
+        return {
+            "title": story_title,
+            "description": f"Resolve {title.lower()} and improve payment service reliability. {description}".strip(),
+            "story_points": 8 if severity in {"Critical", "High"} else 5,
+            "priority": severity if severity in {"Critical", "High", "Medium", "Low"} else "High",
+            "status": "Backlog",
+            "sprint": "Sprint 24",
+            "acceptance_criteria": acceptance_criteria,
+            "evidence": evidence,
+        }
+
     def _build_story_from_topic(self, topic: str, logs: list[dict[str, Any]]) -> dict[str, Any]:
         """Build a story structure based on the specified topic."""
         topic_lower = topic.lower()
+        # Also check log messages for keywords when topic itself is generic
+        log_messages = " ".join(log.get("message", "") for log in logs).lower()
+        search_text = topic_lower + " " + log_messages
         
-        if "timeout" in topic_lower or "failover" in topic_lower:
+        if "timeout" in search_text or "failover" in search_text:
             title = "Improve payment gateway timeout recovery and provider failover"
             description = (
                 "Handle provider timeouts with bounded retries, safe failure states, "
@@ -543,7 +993,7 @@ class OrchestratorAgent:
                 "Monitoring alerts when failover rate exceeds threshold",
                 "Automated tests cover timeout, retry, and recovery scenarios",
             ]
-        elif "pool" in topic_lower or "capacity" in topic_lower:
+        elif "pool" in search_text or "capacity" in search_text:
             title = "Protect payment capacity during traffic spikes"
             description = (
                 "Implement connection-pool protection, retry backoff, and capacity "
@@ -556,7 +1006,7 @@ class OrchestratorAgent:
                 "Circuit breakers protect downstream services",
                 "Load tests cover traffic spikes and recovery",
             ]
-        elif "fraud" in topic_lower:
+        elif "fraud" in search_text:
             title = "Reduce fraud scoring latency"
             description = (
                 "Optimize fraud scoring to meet transaction processing SLA "
@@ -569,7 +1019,7 @@ class OrchestratorAgent:
                 "Latency metrics are visible in dashboards",
                 "Automated tests validate scoring performance",
             ]
-        elif "reconciliation" in topic_lower or "balance" in topic_lower:
+        elif "reconciliation" in search_text or "balance" in search_text:
             title = "Strengthen reconciliation mismatch detection"
             description = (
                 "Detect and surface reconciliation mismatches before settlement "
@@ -583,10 +1033,20 @@ class OrchestratorAgent:
                 "Automated tests validate mismatch detection",
             ]
         else:
-            title = f"Improve {topic}"
-            description = f"Address production reliability issues related to {topic} to improve system stability and customer experience."
+            # Clean the topic for a natural story title. Strip trailing
+            # adjectives/state words (e.g. "is critical", "is down", "is slow")
+            # so "system health is critical" becomes "system health".
+            clean_topic = re.sub(
+                r"\s+(is|are|was|were|has|have|being)\s+[a-z]+$",
+                "",
+                topic_lower,
+            ).strip()
+            if not clean_topic or len(clean_topic) < 3:
+                clean_topic = topic_lower
+            title = f"Improve {clean_topic}"
+            description = f"Address production reliability issues related to {clean_topic} to improve system stability and customer experience."
             acceptance_criteria = [
-                f"Production issues related to {topic} are resolved",
+                f"Production issues related to {clean_topic} are resolved",
                 "Solution is tested in staging environment",
                 "Monitoring is in place to detect regressions",
                 "Documentation is updated",
@@ -895,9 +1355,30 @@ class OrchestratorAgent:
             for item in deployments
         ) + "."
 
+    @staticmethod
+    def _is_top_issue_request(query: str) -> bool:
+        query_lower = query.lower()
+        return (
+            any(phrase in query_lower for phrase in ("top issue", "biggest issue", "most important issue", "top problem"))
+            and any(term in query_lower for term in ("project", "current", "overall", "system"))
+        )
+
     def _fallback_response(self, persona: str, query: str, contexts: list[dict[str, Any]]) -> str:
         query_lower = query.lower()
         successful = [context for context in contexts if context.get("success")]
+
+        if self._is_top_issue_request(query):
+            priorities = self.last_insights.get("priorities", [])
+            if not priorities:
+                return f"{persona}, I could not identify a current top issue from the available project data."
+            top = priorities[0]
+            incident = f" ({top['incident_id']})" if top.get("incident_id") else ""
+            return (
+                f"{persona}, the top issue is {top.get('theme', 'the highest-priority issue')}{incident}.\n"
+                f"Why: {top.get('reason', 'It has the highest current impact.')}\n"
+                f"Priority: {top.get('suggested_priority', 'High')}\n"
+                f"Estimated effort: {top.get('story_points_estimate', 'Not estimated')} story points."
+            )
         
         # === PRIORITY HANDLING: Story Planning Queries ===
         # These need intelligent analysis, not just data listing
@@ -983,6 +1464,28 @@ class OrchestratorAgent:
             story_key = story_detail_context.get("story_key", "the requested story")
             story = story_detail_context.get("data", {})
             if story:
+                # Check if user wants a test case for this story (before returning story details)
+                if any(term in query_lower for term in ("test case", "test cases", "qa test", "write a test")):
+                    return (
+                        f"{persona}, here is a QA test case for {story.get('story_key', 'the story')}:\n\n"
+                        f"Test case: Verify {story.get('title', 'the story')}\n"
+                        f"Objective: Confirm the implementation meets the story requirements.\n"
+                        "Preconditions:\n- Test environment is available.\n- Required payment test data and provider stubs are configured.\n\n"
+                        "Steps:\n"
+                        "1. Submit a representative payment request.\n"
+                        "2. Simulate the primary provider failure or timeout described by the story.\n"
+                        "3. Observe retry, failover, monitoring, and final transaction state.\n"
+                        "4. Repeat with a successful provider response after the failure.\n\n"
+                        "Expected results:\n"
+                        "- The failure is handled according to the story acceptance criteria.\n"
+                        "- Retries are bounded and do not duplicate a successful transaction.\n"
+                        "- Monitoring and alerts contain actionable diagnostic context.\n"
+                        "- The final transaction state is correct and auditable.\n\n"
+                        "Pass criteria: all expected results pass and no duplicate, lost, or incorrectly settled transaction is observed."
+                    )
+                wants_point_estimate = "estimate" in query_lower and "point" in query_lower
+                if wants_point_estimate:
+                    return self._format_story_point_estimate(persona, story, story_key)
                 return (
                     f"{persona}, here are the details for {story.get('story_key', story_key)}:\n\n"
                     f"Title: {story.get('title', 'Untitled story')}\n"
@@ -1257,7 +1760,9 @@ class OrchestratorAgent:
         if self._is_story_drafting_request(user_query):
             topic = self._extract_story_topic(user_query)
             if topic:
-                agents_used, contexts = await self.retrieve_context(user_query, None)
+                incident_id = self._extract_incident_id(topic)
+                intent = {"agents": ["ServiceNow Agent", "Splunk Agent"]} if incident_id else None
+                agents_used, contexts = await self.retrieve_context(user_query, intent)
                 return self._draft_story_for_topic(user_persona, topic, contexts)
             else:
                 return f"{user_persona}, I'd be happy to help you write a user story. What feature or issue should the story address?"
@@ -1284,11 +1789,44 @@ class OrchestratorAgent:
             
             return self._format_production_and_pending(user_persona, deployments, pending_stories)
         
-        # ===== CONTINUE WITH EXISTING LOGIC =====
+        # ===== LAYER 3: CONFIRMATION HANDLING =====
+        # If we have a pending action, check if user is confirming or rejecting
+        if self.pending_action:
+            if self._is_user_confirming(user_query):
+                # User confirmed — execute the stored action
+                action = self.pending_action
+                self.pending_action = None
+                return await self._execute_confirmed_action(action)
+            elif self._is_user_rejecting(user_query):
+                # User rejected — clear and ask what else they need
+                self.pending_action = None
+                return f"{user_persona}, understood. What else can I help you with?"
+            else:
+                # User sent a new query instead of confirming — clear pending and proceed with new query
+                self.pending_action = None
+
+        # ===== LAYER 4: INTENT CLASSIFICATION =====
         
-        self.last_intent = self.intent_classifier.classify(user_query)
+        self.last_intent = self.intent_classifier.classify(
+            user_query,
+            conversation_history=conversation_history,
+            has_pending_stories=bool(self.pending_stories),
+        )
         if self.last_intent.get("intent") == "greeting":
             return f"Hello, {user_persona}. I’m MAHALO, your SDLC assistant. Ask me about delivery, incidents, deployments, logs, or production planning."
+
+        # ===== LAYER 5: INTERPRETATION BEFORE ACTION =====
+        # Present understanding and ask for confirmation (unless exempt)
+        if not self._should_skip_confirmation(self.last_intent, user_query, conversation_history):
+            self.pending_action = {
+                "intent": self.last_intent,
+                "query": user_query,
+                "persona": user_persona,
+                "conversation_history": conversation_history,
+            }
+            return self._build_interpretation_message(user_persona, self.last_intent, user_query)
+
+        # ===== LAYER 6: DIRECT EXECUTION (exempt intents or follow-ups) =====
         # Check for follow-up on pending stories (must be specific to avoid false positives)
         follow_up = (
             self.pending_stories and  # Only if we have pending stories
@@ -1301,10 +1839,15 @@ class OrchestratorAgent:
             "elaborate" in user_query_lower and 
             ("story" in user_query_lower or "stories" in user_query_lower) and
             self.pending_stories
+        ) or (
+            self.pending_stories and self.last_intent.get("intent") == "review_pending_stories"
         )
         review_first = any(term in user_query_lower for term in ("review", "before you create", "before creating", "do not create", "don't create", "first"))
-        explicit_jira_write = not review_first and "jira" in user_query_lower and any(
-            action in user_query_lower for action in ("create", "save", "write", "add")
+        explicit_jira_write = not review_first and (
+            (
+                "jira" in user_query_lower and
+                any(action in user_query_lower for action in ("create", "save", "write", "add"))
+            ) or self.last_intent.get("intent") == "confirm_create_story"
         )
         if (follow_up or explicit_jira_write) and self.pending_stories:
             if explicit_jira_write:
@@ -1322,11 +1865,29 @@ class OrchestratorAgent:
                     return self._format_priority_explanation(user_persona, selected_story)
                 return self._format_story_draft(user_persona, selected_story)
             return self._format_story_drafts(user_persona, self.pending_stories)
-        agents_used, contexts = await self.retrieve_context(user_query, self.last_intent)
+        context_query = "executive overview" if self._is_top_issue_request(user_query) else user_query
+        context_intent = (
+            {"agents": ["JIRA Agent", "ServiceNow Agent", "Splunk Agent"]}
+            if self._is_top_issue_request(user_query)
+            else self.last_intent
+        )
+        agents_used, contexts = await self.retrieve_context(context_query, context_intent)
         
         # Perform intelligent correlation across agent contexts
         insights = self.correlation_engine.correlate_contexts(contexts)
         self.last_insights = insights
+        if self._is_top_issue_request(user_query):
+            priorities = insights.get("priorities", [])
+            if priorities:
+                top = priorities[0]
+                incident = f" ({top['incident_id']})" if top.get("incident_id") else ""
+                return (
+                    f"{user_persona}, the top issue is {top.get('theme', 'the highest-priority issue')}{incident}.\n"
+                    f"Why: {top.get('reason', 'It has the highest current impact.')}\n"
+                    f"Priority: {top.get('suggested_priority', 'High')}\n"
+                    f"Estimated effort: {top.get('story_points_estimate', 'Not estimated')} story points."
+                )
+            return f"{user_persona}, I could not identify a current top issue from the available project data."
         if ("analyze" in user_query_lower or "analyse" in user_query_lower) and ("story" in user_query_lower or "stories" in user_query_lower):
             self.pending_stories = self._draft_stories_from_context(contexts)
         if ("suggest" in user_query_lower or "recommend" in user_query_lower) and ("story" in user_query_lower or "stories" in user_query_lower):
@@ -1347,16 +1908,23 @@ class OrchestratorAgent:
         
         if settings.ONE_MIN_AI_API_KEY:
             try:
-                response = completion(
+                response = await one_min_ai_completion(
                     model=settings.LITELLM_MODEL,
-                    api_key=settings.ONE_MIN_AI_API_KEY,
-                    base_url=settings.ONE_MIN_AI_BASE_URL,
                     messages=[
                         {
                             "role": "system",
                             "content": (
-                                f"You are MAHALO orchestrator for persona '{user_persona}'. "
-                                "You are an intelligent assistant that ANALYZES data, not just reports it.\n\n"
+                                "You are MAHALO's reasoning orchestrator. Interpret the user's underlying goal; "
+                                "do not treat every phrase as a literal search term or repeat empty tool results.\n"
+                                "Use the available evidence to answer the question directly, synthesize across tools, "
+                                "and explain uncertainty when the evidence is insufficient. Distinguish requests for "
+                                "status, diagnosis, prioritization, recommendation, story drafting, and execution. "
+                                "Never claim an action was performed unless a write tool succeeded.\n\n"
+                                f"{self._role_system_instructions(user_persona)}\n\n"
+                                f"=== CLASSIFIED INTENT ===\n"
+                                f"Intent: {self.last_intent.get('intent', 'general_sdlc')}\n"
+                                f"Confidence: {self.last_intent.get('confidence', 0.5)}\n"
+                                f"Target agents: {', '.join(self.last_intent.get('agents', []))}\n\n"
                                 "CRITICAL INSTRUCTIONS:\n"
                                 "1. When asked about 'priority' or 'how many stories', ANALYZE the error patterns and provide intelligent recommendations\n"
                                 "2. Group similar errors into themes (e.g., timeout errors, connection pool errors, latency errors)\n"
